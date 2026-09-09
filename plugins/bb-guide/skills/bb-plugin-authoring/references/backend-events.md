@@ -277,12 +277,11 @@ example, Worktree copies `.worktreeinclude` files).
 
 ### bb.http — HTTP routes
 
-`bb.http.route(method, path, handler, { auth? })` mounts an exact-match route
-at `/api/v1/plugins/<id>/http/<path>`. The allowed methods are `GET`, `POST`,
+`bb.http.route(method, path, handler, { auth? })` mounts a route at
+`/api/v1/plugins/<id>/http/<path>`. The allowed methods are `GET`, `POST`,
 `PUT`, `PATCH`, `DELETE`, `HEAD`, and `OPTIONS`. The path must start with `/`.
-The router treats `:` and `*` as literal characters, not parameters or
-wildcards. The handler is a Hono handler:
-`(context) => Response | Promise<Response>`.
+The router treats `:` as a literal character, not a parameter. The handler is
+a Hono handler: `(context) => Response | Promise<Response>`.
 Auth modes:
 
 - `"local"` (default) — accepts no `Origin` header or a trusted BB app origin.
@@ -293,10 +292,46 @@ Auth modes:
   `x-bb-plugin-token` header or `?token=`. Right for external scripts
   and machines you control.
 - `"none"` — no checks. ONLY for webhooks that verify their own signature
-  (e.g. Slack's `x-slack-signature` HMAC) inside the handler.
+  (e.g. Slack's `x-slack-signature` HMAC) inside the handler, and for
+  documents rendered in a sandboxed frame (see below).
+
+#### Prefix routes
+
+A path ending in `/*` matches every path below that prefix, which is how a
+plugin serves a directory whose filenames it cannot know in advance — a static
+site, a docs tree, a page with its own stylesheet and images. `*` is allowed
+only as that final segment; anywhere else it is rejected at registration.
+
+```ts
+bb.http.route(
+  "GET",
+  "/page/*",
+  (context) => {
+    // context.req.path is the whole request path, mount included:
+    // /api/v1/plugins/<id>/http/page/thr_x/figures/a.png
+    const rest = context.req.path.split("/http/page/")[1] ?? "";
+    return serveFile(rest);
+  },
+  { auth: "none" },
+);
+```
+
+Lookup runs in two steps: an exact route wins over any prefix route, and among
+prefix routes the longest match wins. So `/page/index.html` registered exactly
+still beats `/page/*`, and `/page/assets/*` beats `/page/*` for
+`/page/assets/x.css`. `/page/*` does not match `/page` itself, nor `/pages`.
+There is no path parameter: the handler reads the matched remainder off
+`context.req.path`, which the fake host in `@get-bb/plugin-sdk/testing`
+reproduces exactly, so prefix handlers can be unit-tested offline.
+
+A route that serves documents rendered in a **sandboxed frame must use
+`auth: "none"` and validate the request itself**. An opaque-origin sandboxed
+document sends `Origin: null` on `fetch()`, and `auth: "local"` refuses that,
+so the document's own subresource requests would 403 under the default mode.
 
 `bb.http.experimental_websocket(path, handler, { auth? })` uses the same path
-namespace and auth modes. A plain GET does not invoke it, so HTTP and WebSocket
+namespace and auth modes, but its path always matches exactly — the `/*`
+prefix form is HTTP-only. A plain GET does not invoke it, so HTTP and WebSocket
 routes may share a path. The handler receives `request`, `url`, and `headers`
 and returns `onOpen`, `onMessage`, `onClose`, and/or `onError`. Messages are
 strings or `Uint8Array`; reload and disable close old-generation sockets 1012.

@@ -661,6 +661,61 @@ describe("http", () => {
     );
   });
 
+  it("resolves prefix routes like the host: exact first, then longest prefix", async () => {
+    const { bb, harness } = createFakePluginHost({ pluginId: "pages" });
+    const register = (path: string) =>
+      bb.http.route(
+        "GET",
+        path,
+        (context) => context.json({ matched: path, path: context.req.path }),
+        { auth: "none" },
+      );
+    register("/page/*");
+    register("/page/assets/*");
+    register("/page/assets/pinned.css");
+
+    const nested = await harness.fetchHttp("GET", "/page/thr_9ai8/a.png");
+    expect(await nested.json()).toEqual({
+      matched: "/page/*",
+      path: "/api/v1/plugins/pages/http/page/thr_9ai8/a.png",
+    });
+
+    const longer = await harness.fetchHttp("GET", "/page/assets/x.css");
+    expect(await longer.json()).toMatchObject({ matched: "/page/assets/*" });
+
+    const exact = await harness.fetchHttp("GET", "/page/assets/pinned.css");
+    expect(await exact.json()).toMatchObject({
+      matched: "/page/assets/pinned.css",
+    });
+
+    await expect(harness.fetchHttp("GET", "/pages/x.css")).rejects.toThrow(
+      "no http route GET /pages/x.css is registered",
+    );
+    await expect(harness.fetchHttp("GET", "/page")).rejects.toThrow(
+      "no http route GET /page is registered",
+    );
+    await expect(
+      harness.fetchHttp("DELETE", "/page/thr_9ai8/a.png"),
+    ).rejects.toThrow(
+      "no http route DELETE /page/thr_9ai8/a.png is registered",
+    );
+  });
+
+  it('rejects "*" outside a final "/*" segment at registration', () => {
+    const { bb } = createFakePluginHost();
+    for (const path of ["/page/*/thumb", "/page/*.css", "/*page", "/page*"]) {
+      expect(() => bb.http.route("GET", path, (c) => c.body(null))).toThrow(
+        `http route path ${JSON.stringify(path)} may only use "*" as its final "/*" segment`,
+      );
+    }
+    expect(() =>
+      bb.http.route("GET", "/page/*", (c) => c.body(null)),
+    ).not.toThrow();
+    expect(() => bb.http.route("GET", "/page/*", (c) => c.body(null))).toThrow(
+      "http route GET /page/* is already registered",
+    );
+  });
+
   it("maps a throwing handler to the host's 500 shape", async () => {
     const { bb, harness } = createFakePluginHost();
     bb.http.route("GET", "/boom", () => {

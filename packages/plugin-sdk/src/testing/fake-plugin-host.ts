@@ -19,6 +19,7 @@ import {
   coerceStoredPluginSettingValue,
   enforcePluginCliOutputLimit,
   isStandardSchema,
+  matchPluginHttpRoute,
   storePluginHook,
   validatePluginEnvironmentProviderDeclaration,
   validatePluginMachineProviderDeclaration,
@@ -382,9 +383,13 @@ export interface FakePluginBehaviorDrivers {
     ctx?: PluginCliContext,
   ): Promise<PluginCliExecutionResult>;
   /**
-   * Dispatch a request to a registered `bb.http` route (exact method+path
-   * match, like the host's V1 router) through a real Hono context. Auth
-   * modes are not enforced. A throwing handler yields the host's 500
+   * Dispatch a request to a registered `bb.http` route through a real Hono
+   * context, resolved by the host's rule: exact method+path first, then the
+   * longest matching `/*` prefix route. `path` is plugin-relative, and the
+   * handler sees it mounted where the host mounts it
+   * (`context.req.path === "/api/v1/plugins/<pluginId>/http<path>"`), so a
+   * prefix route can read its remainder offline exactly as it does in bb.
+   * Auth modes are not enforced. A throwing handler yields the host's 500
    * `{ ok: false, error: "plugin route failed: …" }` response.
    */
   fetchHttp(
@@ -1794,14 +1799,15 @@ function createFakePluginHostInternal(
 
     async fetchHttp(method, path, init) {
       const normalizedMethod = String(method).toUpperCase();
-      const pathname = new URL(path, "http://plugin.test").pathname;
-      const route = httpRoutes.find(
-        (candidate) =>
-          candidate.method === normalizedMethod && candidate.path === pathname,
+      const requested = new URL(path, "http://plugin.test");
+      const route = matchPluginHttpRoute(
+        httpRoutes,
+        normalizedMethod,
+        requested.pathname,
       );
       if (!route) {
         throw new Error(
-          `no http route ${normalizedMethod} ${pathname} is registered — ` +
+          `no http route ${normalizedMethod} ${requested.pathname} is registered — ` +
             `registered: ${
               httpRoutes.map((r) => `${r.method} ${r.path}`).join(", ") ||
               "(none)"
@@ -1809,7 +1815,7 @@ function createFakePluginHostInternal(
         );
       }
       const app = new Hono();
-      app.on(route.method, route.path, async (context) => {
+      app.all("*", async (context) => {
         try {
           return adoptHttpRouteResponse(await route.handler(context));
         } catch (error) {
@@ -1824,7 +1830,10 @@ function createFakePluginHostInternal(
           );
         }
       });
-      return app.request(path, { ...init, method: normalizedMethod });
+      return app.request(
+        `/api/v1/plugins/${pluginId}/http${requested.pathname}${requested.search}`,
+        { ...init, method: normalizedMethod },
+      );
     },
 
     async experimental_openWebSocket(path, init) {

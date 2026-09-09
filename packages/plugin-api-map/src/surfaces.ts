@@ -659,7 +659,7 @@ export const SURFACE_GROUPS: SurfaceGroup[] = [
           "Connects the plugin's own UI, its server code, and outside services. With this, a plugin can:",
         bullets: [
           "Call its server from its UI over RPC, with arguments and results checked against a schema",
-          "Serve exact-path HTTP and WebSocket routes other systems can call, webhooks included",
+          "Serve HTTP routes other systems can call — one exact path, or a whole `/*` prefix for a directory of files — plus exact-path WebSocket routes, webhooks included",
           "Push messages to every open bb window, so the UI does not have to poll",
         ],
         apiSymbols: [

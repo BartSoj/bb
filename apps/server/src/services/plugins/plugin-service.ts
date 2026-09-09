@@ -33,6 +33,7 @@ import {
   normalizeRpcJsonResult,
   RESERVED_AGENT_TOOL_NAMES,
   adoptHttpRouteResponse,
+  matchPluginHttpRoute,
   validatePluginProviderEnvEntries,
   validateRpcValue,
   validateSettingsUpdate,
@@ -1712,9 +1713,7 @@ export function createPluginService(deps: PluginServiceDeps): PluginService {
     getHttpRoute(id, method, path) {
       const normalizedMethod = method.toUpperCase();
       return wireLookup(id, (plugin) =>
-        plugin.handle.httpRoutes.find(
-          (route) => route.method === normalizedMethod && route.path === path,
-        ),
+        matchPluginHttpRoute(plugin.handle.httpRoutes, normalizedMethod, path),
       );
     },
 

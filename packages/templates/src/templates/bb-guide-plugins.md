@@ -851,7 +851,8 @@ finished hidden workers when appropriate and call `threads.stop` in a
 `finally` block to release each agent runtime promptly);
 bb.events.on (observe thread.created/idle/failed/deleted);
 bb.http.route (routes under /api/v1/plugins/<id>/http/* with
-local/token/none auth); defineRpcContract + bb.rpc.register (Standard
+local/token/none auth; a path ending in /* serves every path below it, so a
+plugin can serve a directory whose filenames it cannot know in advance); defineRpcContract + bb.rpc.register (Standard
 Schema-validated frontend data plane with inferred backend handlers and
 type-only frontend method/input/result inference);
 defineRpcContract + bb.hosts.experimental_client (typed calls, typed ephemeral

@@ -786,12 +786,25 @@ export type ExperimentalPluginWebSocketHandler = (
 export interface PluginHttp {
   /**
    * Register an HTTP route, mounted at
-   * `/api/v1/plugins/<id>/http/<path>`. Auth modes (default "local"):
+   * `/api/v1/plugins/<id>/http/<path>`.
+   *
+   * `path` matches exactly unless it ends in `/*`, which matches every path
+   * below that prefix — `"/page/*"` serves `/page/thread/figures/a.png` but
+   * not `/page`. Exact routes win over prefix routes, and the longest
+   * matching prefix wins among prefix routes. `*` anywhere else is rejected
+   * at registration; `:` is always a literal. A prefix handler reads the
+   * matched remainder off `context.req.path`, which carries the whole
+   * request path including the `/api/v1/plugins/<id>/http` mount.
+   *
+   * Auth modes (default "local"):
    * - "local": Origin/Host must be a local BB app origin; non-GET requires
    *   content-type application/json (forces a CORS preflight).
    * - "token": requires the per-plugin token (`bb plugin token <id>`) via
    *   the x-bb-plugin-token header or ?token=.
-   * - "none": no checks — only for signature-verified webhooks.
+   * - "none": no checks — only for signature-verified webhooks, and for
+   *   documents a sandboxed opaque-origin frame fetches (it sends
+   *   `Origin: null`, which "local" refuses), which must then validate the
+   *   request themselves.
    */
   route(
     method: string,
@@ -803,7 +816,8 @@ export interface PluginHttp {
   /**
    * Register a WebSocket route in the same `/http/` namespace as `route`.
    * A GET request upgrades only when it carries `Upgrade: websocket`.
-   * Auth modes and exact-path matching are identical to HTTP routes.
+   * Auth modes are identical to HTTP routes. The path always matches
+   * exactly: `route`'s trailing `/*` prefix matching does not apply here.
    */
   experimental_websocket(
     path: string,

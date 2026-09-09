@@ -48,6 +48,12 @@ const WIRE_SOURCE = `
     bb.http.route("GET", "/boom", () => {
       throw new Error("route boom");
     });
+    bb.http.route("GET", "/page/*", (c: any) =>
+      c.json({ matched: "/page/*", path: c.req.path }), { auth: "none" });
+    bb.http.route("GET", "/page/assets/*", (c: any) =>
+      c.json({ matched: "/page/assets/*", path: c.req.path }), { auth: "none" });
+    bb.http.route("GET", "/page/assets/pinned.css", (c: any) =>
+      c.json({ matched: "/page/assets/pinned.css" }), { auth: "none" });
     // A structurally valid Response whose prototype is not this realm's
     // Response, as a handler running in another realm would return (#1661).
     bb.http.route("GET", "/foreign", () => {
@@ -494,6 +500,73 @@ describe("plugin wire surfaces (http/rpc dispatcher + realtime)", () => {
       release();
       delete (globalThis as any).__releaseSecondChunk;
     }
+  });
+
+  it("serves a prefix route: exact wins, then the longest matching prefix", async () => {
+    const nested = await harness.app.request(
+      `${BASE}/api/v1/plugins/wire/http/page/thr_9ai8/figures/a.png`,
+    );
+    expect(nested.status).toBe(200);
+    expect(await nested.json()).toEqual({
+      matched: "/page/*",
+      path: "/api/v1/plugins/wire/http/page/thr_9ai8/figures/a.png",
+    });
+
+    const longer = await harness.app.request(
+      `${BASE}/api/v1/plugins/wire/http/page/assets/x.css`,
+    );
+    expect(await longer.json()).toEqual({
+      matched: "/page/assets/*",
+      path: "/api/v1/plugins/wire/http/page/assets/x.css",
+    });
+
+    const exact = await harness.app.request(
+      `${BASE}/api/v1/plugins/wire/http/page/assets/pinned.css`,
+    );
+    expect(await exact.json()).toEqual({
+      matched: "/page/assets/pinned.css",
+    });
+  });
+
+  it("keeps a prefix route out of sibling paths and off the prefix itself", async () => {
+    const sibling = await harness.app.request(
+      `${BASE}/api/v1/plugins/wire/http/pages/x.css`,
+    );
+    expect(sibling.status).toBe(404);
+    expect(await sibling.json()).toMatchObject({
+      ok: false,
+      error: 'plugin "wire" has no GET route for "/pages/x.css"',
+    });
+
+    const bare = await harness.app.request(
+      `${BASE}/api/v1/plugins/wire/http/page`,
+    );
+    expect(bare.status).toBe(404);
+
+    const otherMethod = await harness.app.request(
+      `${BASE}/api/v1/plugins/wire/http/page/thr_9ai8/a.png`,
+      { method: "DELETE" },
+    );
+    expect(otherMethod.status).toBe(404);
+  });
+
+  it('fails the load when a route path uses "*" outside a final "/*" segment', async () => {
+    const invalid = await writePlugin(
+      join(harness.config.dataDir, "fixtures"),
+      {
+        name: "bb-plugin-badstar",
+        serverSource: `
+        export default function plugin(bb: any) {
+          bb.http.route("GET", "/page/*/thumb", (c: any) => c.json({}));
+        }
+      `,
+      },
+    );
+    const entry = await harness.pluginService.installPath(invalid);
+    expect(entry.status).toBe("error");
+    expect(entry.statusDetail).toContain(
+      'http route path "/page/*/thumb" may only use "*" as its final "/*" segment',
+    );
   });
 
   it("rejects a non-Response return with a pointed 500 at the invoke boundary", async () => {

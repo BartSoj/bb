@@ -2118,6 +2118,56 @@ export function enforcePluginCliOutputLimit(
     : { exitCode: 1, stdout: "", stderr: error.message, error };
 }
 
+/** Trailing segment that turns an HTTP route path into a prefix route. */
+export const PLUGIN_HTTP_PREFIX_SUFFIX = "/*";
+
+/**
+ * Reject `*` anywhere but as the final `/*` segment of an HTTP route path.
+ *
+ * A path is either exact or a prefix route ending in `/*`. Any other `*` is a
+ * literal the router will never match, so `/a*b` or `/*\/b` is almost always
+ * an author expecting a wildcard they will not get. Failing at registration
+ * says so instead of serving 404s.
+ */
+export function pluginHttpRoutePathProblem(path: string): string | null {
+  const star = path.indexOf("*");
+  if (star === -1) return null;
+  if (star === path.length - 1 && path.endsWith(PLUGIN_HTTP_PREFIX_SUFFIX)) {
+    return null;
+  }
+  return (
+    `http route path ${JSON.stringify(path)} may only use "*" as its final ` +
+    `"/*" segment, which matches every path under that prefix`
+  );
+}
+
+/**
+ * Resolve the route that serves `method` `path`: an exact match wins, then the
+ * longest registered `/*` prefix. `method` must already be upper-cased.
+ *
+ * A prefix route matches only paths below its prefix, so `/page/*` serves
+ * `/page/a/b.css` but not `/page` and not `/pages`. Shared so the fake host
+ * resolves a request exactly as the server does.
+ */
+export function matchPluginHttpRoute<
+  Route extends { method: string; path: string },
+>(routes: readonly Route[], method: string, path: string): Route | undefined {
+  const exact = routes.find(
+    (route) => route.method === method && route.path === path,
+  );
+  if (exact) return exact;
+  let longest: Route | undefined;
+  for (const route of routes) {
+    if (route.method !== method) continue;
+    if (!route.path.endsWith(PLUGIN_HTTP_PREFIX_SUFFIX)) continue;
+    if (!path.startsWith(route.path.slice(0, -1))) continue;
+    if (longest === undefined || route.path.length > longest.path.length) {
+      longest = route;
+    }
+  }
+  return longest;
+}
+
 /**
  * Adopt the value a plugin HTTP route handler returned.
  *
@@ -2742,6 +2792,8 @@ export function normalizeHttpRouteRegistration(
       `http route path must be a string starting with "/", got ${JSON.stringify(path)}`,
     );
   }
+  const pathProblem = pluginHttpRoutePathProblem(path);
+  if (pathProblem) throw new Error(pathProblem);
   if (typeof handler !== "function") {
     throw new Error(
       `http route handler for ${normalizedMethod} ${path} must be a function`,
