@@ -175,6 +175,12 @@ import {
   handleListAccountServers,
   verifyDesktopSessionCookie,
 } from "./servers.js";
+import {
+  PAGE_GRANT_TTL_MS,
+  createPageGrantToken,
+  pageGrantPathPrefix,
+  verifyPageGrantToken,
+} from "./page-grant.js";
 import { SECURE_DESKTOP_SESSION_COOKIE as DESKTOP_SESSION_COOKIE } from "./cloud-dev.js";
 import { handleAssignMachineLabel } from "./machine-label.js";
 import { serveWithCache } from "./cache.js";
@@ -682,6 +688,311 @@ describe("machine gate auth", () => {
       expect(mockVerifyMachine).not.toHaveBeenCalled();
     },
   );
+});
+
+describe("connect page grants", () => {
+  const GRANT_PLUGIN = "thread-pages";
+  const GRANT_SECRET = "test-secret";
+
+  function grantClaims(
+    over: Partial<{
+      expiresAt: number;
+      handle: string;
+      pluginId: string;
+      userId: string;
+    }> = {},
+  ) {
+    return {
+      expiresAt: over.expiresAt ?? Date.now() + 60_000,
+      handle: over.handle ?? "sawyer",
+      pluginId: over.pluginId ?? GRANT_PLUGIN,
+      userId: over.userId ?? OWNER,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockResolveLabel.mockResolvedValue(resolvedServer());
+    mockParseCookie.mockReturnValue(null);
+  });
+
+  it("forwards a subresource with the grant prefix stripped from the path", async () => {
+    const token = await createPageGrantToken(grantClaims(), GRANT_SECRET);
+    const { env, ctx, captured } = makeEnv(() => new Response("body{}"));
+    const response = await worker.fetch(
+      visitorRequest(
+        "sawyer.getbb.app",
+        `${pageGrantPathPrefix(GRANT_PLUGIN, token)}/page/thr_x/style.css`,
+        {
+          headers: {
+            "x-bb-cloud-dev-host": "smuggled",
+            [GATE_AUTH_HEADER]: "machine",
+            [GATE_MACHINE_ID_HEADER]: "forged",
+          },
+        },
+      ),
+      env as never,
+      ctx,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("body{}");
+    expect(captured).toHaveLength(1);
+    expect(new URL(captured[0].url).pathname).toBe(
+      `/api/v1/plugins/${GRANT_PLUGIN}/http/page/thr_x/style.css`,
+    );
+    expect(captured[0].headers.get(GATE_AUTH_HEADER)).toBe("session");
+    expect(captured[0].headers.get(GATE_MACHINE_ID_HEADER)).toBeNull();
+    expect(captured[0].headers.get("x-bb-cloud-dev-host")).toBeNull();
+    expect(captured[0].headers.get(TUNNEL_TARGET_HEADER)).toBeNull();
+    expect(mockServeWithCache).not.toHaveBeenCalled();
+    expect(mockVerifySessionDetails).not.toHaveBeenCalled();
+  });
+
+  it("forwards the plugin http root when the grant carries no sub-path", async () => {
+    const token = await createPageGrantToken(grantClaims(), GRANT_SECRET);
+    const { env, ctx, captured } = makeEnv(() => new Response("root"));
+    const response = await worker.fetch(
+      visitorRequest(
+        "sawyer.getbb.app",
+        pageGrantPathPrefix(GRANT_PLUGIN, token),
+      ),
+      env as never,
+      ctx,
+    );
+
+    expect(response.status).toBe(200);
+    expect(new URL(captured[0].url).pathname).toBe(
+      `/api/v1/plugins/${GRANT_PLUGIN}/http/`,
+    );
+  });
+
+  it("falls through to the sign-in page for an expired grant", async () => {
+    const token = await createPageGrantToken(
+      grantClaims({ expiresAt: Date.now() - 1000 }),
+      GRANT_SECRET,
+    );
+    const { env, ctx, captured } = makeEnv(() => new Response("origin"));
+    const response = await worker.fetch(
+      visitorRequest(
+        "sawyer.getbb.app",
+        `${pageGrantPathPrefix(GRANT_PLUGIN, token)}/style.css`,
+      ),
+      env as never,
+      ctx,
+    );
+
+    expect(response.status).toBe(401);
+    expect(await response.text()).toContain("Sign in with the account");
+    expect(captured).toHaveLength(0);
+  });
+
+  it("refuses a grant issued for another user, handle, or plugin", async () => {
+    const cases = [
+      grantClaims({ userId: OTHER }),
+      grantClaims({ handle: "someone-else" }),
+      grantClaims({ pluginId: "other-plugin" }),
+    ];
+    const { env, ctx, captured } = makeEnv(() => new Response("origin"));
+    for (const claims of cases) {
+      const token = await createPageGrantToken(claims, GRANT_SECRET);
+      const response = await worker.fetch(
+        visitorRequest(
+          "sawyer.getbb.app",
+          `${pageGrantPathPrefix(GRANT_PLUGIN, token)}/style.css`,
+        ),
+        env as never,
+        ctx,
+      );
+      expect(response.status).toBe(401);
+    }
+    expect(captured).toHaveLength(0);
+  });
+
+  it("refuses a tampered signature", async () => {
+    const token = await createPageGrantToken(grantClaims(), GRANT_SECRET);
+    const tampered = `${token.slice(0, -1)}${token.endsWith("A") ? "B" : "A"}`;
+    const { env, ctx, captured } = makeEnv(() => new Response("origin"));
+    const response = await worker.fetch(
+      visitorRequest(
+        "sawyer.getbb.app",
+        `${pageGrantPathPrefix(GRANT_PLUGIN, tampered)}/style.css`,
+      ),
+      env as never,
+      ctx,
+    );
+
+    expect(response.status).toBe(401);
+    expect(captured).toHaveLength(0);
+  });
+
+  it("refuses a mutation that carries a valid grant", async () => {
+    const token = await createPageGrantToken(grantClaims(), GRANT_SECRET);
+    const { env, ctx, captured } = makeEnv(() => new Response("origin"));
+    const response = await worker.fetch(
+      visitorRequest(
+        "sawyer.getbb.app",
+        `${pageGrantPathPrefix(GRANT_PLUGIN, token)}/save`,
+        { method: "POST" },
+      ),
+      env as never,
+      ctx,
+    );
+
+    expect(response.status).toBe(401);
+    expect(captured).toHaveLength(0);
+  });
+
+  it("refuses a grant on a share host", async () => {
+    const token = await createPageGrantToken(grantClaims(), GRANT_SECRET);
+    const { env, ctx, captured } = makeEnv(() => new Response("origin"));
+    const response = await worker.fetch(
+      visitorRequest(
+        "sawyer--8000.getbb.app",
+        `${pageGrantPathPrefix(GRANT_PLUGIN, token)}/style.css`,
+      ),
+      env as never,
+      ctx,
+    );
+
+    expect(response.status).toBe(401);
+    expect(captured).toHaveLength(0);
+  });
+
+  it("never lets a grant reach /internal or a non-plugin route", async () => {
+    const token = await createPageGrantToken(grantClaims(), GRANT_SECRET);
+    const { env, ctx, captured } = makeEnv(() => new Response("origin"));
+    const internal = await worker.fetch(
+      visitorRequest(
+        "sawyer.getbb.app",
+        `/internal/__grant/${token}/session/open`,
+      ),
+      env as never,
+      ctx,
+    );
+    const nonPlugin = await worker.fetch(
+      visitorRequest("sawyer.getbb.app", `/api/v1/threads/__grant/${token}`),
+      env as never,
+      ctx,
+    );
+    const escaped = await worker.fetch(
+      visitorRequest(
+        "sawyer.getbb.app",
+        `${pageGrantPathPrefix(GRANT_PLUGIN, token)}/%2e%2e%2f%2e%2e%2f%2e%2e%2finternal/session/open`,
+      ),
+      env as never,
+      ctx,
+    );
+
+    expect(internal.status).toBe(403);
+    expect(nonPlugin.status).toBe(401);
+    expect(escaped.status).toBe(401);
+    expect(captured).toHaveLength(0);
+  });
+});
+
+describe("GET /api/connect/page-grant", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockResolveLabel.mockResolvedValue(resolvedServer());
+  });
+
+  it("mints a grant bound to the owner, handle, and plugin", async () => {
+    mockParseCookie.mockReturnValue("session-cookie");
+    mockVerifySessionDetails.mockResolvedValue(sessionDetails());
+    mockVerifyDesktopSession.mockResolvedValue(null);
+    const { env, ctx, captured } = makeEnv(() => new Response("origin"));
+    const response = await worker.fetch(
+      visitorRequest(
+        "sawyer.getbb.app",
+        "/api/connect/page-grant?pluginId=thread-pages",
+      ),
+      env as never,
+      ctx,
+    );
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      grant: { expiresAt: number; pathPrefix: string; token: string };
+    };
+    expect(body.grant.pathPrefix).toBe(
+      pageGrantPathPrefix("thread-pages", body.grant.token),
+    );
+    expect(body.grant.expiresAt).toBeLessThanOrEqual(
+      Date.now() + PAGE_GRANT_TTL_MS,
+    );
+    expect(body.grant.expiresAt).toBeGreaterThan(
+      Date.now() + PAGE_GRANT_TTL_MS - 60_000,
+    );
+    await expect(
+      verifyPageGrantToken(body.grant.token, "test-secret"),
+    ).resolves.toEqual({
+      expiresAt: body.grant.expiresAt,
+      handle: "sawyer",
+      pluginId: "thread-pages",
+      userId: OWNER,
+    });
+    expect(captured).toHaveLength(0);
+  });
+
+  it("refuses an unauthenticated caller", async () => {
+    mockParseCookie.mockReturnValue(null);
+    const { env, ctx } = makeEnv(() => new Response("origin"));
+    const response = await worker.fetch(
+      visitorRequest(
+        "sawyer.getbb.app",
+        "/api/connect/page-grant?pluginId=thread-pages",
+      ),
+      env as never,
+      ctx,
+    );
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({ error: "unauthorized" });
+  });
+
+  it("refuses a caller who does not own the server", async () => {
+    mockParseCookie.mockReturnValue("session-cookie");
+    mockVerifySessionDetails.mockResolvedValue(sessionDetails(OTHER));
+    mockVerifyDesktopSession.mockResolvedValue(null);
+    const { env, ctx } = makeEnv(() => new Response("origin"));
+    const response = await worker.fetch(
+      visitorRequest(
+        "sawyer.getbb.app",
+        "/api/connect/page-grant?pluginId=thread-pages",
+      ),
+      env as never,
+      ctx,
+    );
+
+    expect(response.status).toBe(401);
+  });
+
+  it("rejects a malformed plugin id and a non-GET method", async () => {
+    mockParseCookie.mockReturnValue("session-cookie");
+    mockVerifySessionDetails.mockResolvedValue(sessionDetails());
+    const { env, ctx } = makeEnv(() => new Response("origin"));
+    const malformed = await worker.fetch(
+      visitorRequest(
+        "sawyer.getbb.app",
+        "/api/connect/page-grant?pluginId=../internal",
+      ),
+      env as never,
+      ctx,
+    );
+    const posted = await worker.fetch(
+      visitorRequest(
+        "sawyer.getbb.app",
+        "/api/connect/page-grant?pluginId=thread-pages",
+        { method: "POST" },
+      ),
+      env as never,
+      ctx,
+    );
+
+    expect(malformed.status).toBe(400);
+    expect(posted.status).toBe(405);
+  });
 });
 
 describe("bb mobile app-link association files", () => {

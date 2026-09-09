@@ -22,6 +22,11 @@ import {
   handleListAccountServers,
   verifyDesktopSessionCookie,
 } from "./servers.js";
+import {
+  handleCreatePageGrant,
+  parsePageGrantPath,
+  verifyPageGrantToken,
+} from "./page-grant.js";
 import { serveWithCache } from "./cache.js";
 import { BB_ICON_DATA_URI } from "./bb-icon.js";
 import { handleAssignMachineLabel } from "./machine-label.js";
@@ -271,6 +276,9 @@ export default {
     if (url.pathname === "/api/connect/machine-label") {
       return handleAssignMachineLabel(request, env);
     }
+    if (url.pathname === "/api/connect/page-grant") {
+      return handleCreatePageGrant(request, env);
+    }
     const host = resolveConnectRequestHost(request.headers, runtime);
     const parsed = parseVisitorHost(host, env.BASE_DOMAIN);
     if (!parsed) return text("bb connect: unknown host\n", 404);
@@ -379,6 +387,29 @@ export default {
     }
     if (url.pathname.startsWith("/internal")) {
       return text("bb connect: machine not authorized\n", 403);
+    }
+
+    const grantPath =
+      target === null && (request.method === "GET" || request.method === "HEAD")
+        ? parsePageGrantPath(url.pathname)
+        : null;
+    if (grantPath !== null) {
+      const grant = await verifyPageGrantToken(
+        grantPath.token,
+        env.BETTER_AUTH_SECRET,
+      );
+      if (
+        grant !== null &&
+        grant.userId === resolved.userId &&
+        grant.handle === label &&
+        grant.pluginId === grantPath.pluginId
+      ) {
+        const forward = new URL(request.url);
+        forward.pathname = grantPath.forwardPath;
+        return stub.fetch(
+          requestForTunnelDo(new Request(forward, request), null, "session"),
+        );
+      }
     }
 
     const cookieHeader = request.headers.get("cookie");
