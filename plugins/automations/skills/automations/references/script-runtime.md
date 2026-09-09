@@ -19,6 +19,18 @@ The create and update commands print the exact refresh command. The create,
 update, and show commands print the stored path on the `Script:` line. JSON
 output returns it as `execution.storedScriptPath`.
 
+## Working directory
+
+A run works in the project's default local source directory. The plugin uses
+the source marked default, or the first local source when none is marked. It
+falls back to `<data dir>/plugins/automations/scripts/` when the project has no
+local source, when the project is unavailable, or when the source directory
+does not exist on the server host.
+
+A relative path inside a script therefore starts at the project checkout on a
+single-machine install. Use absolute paths when the project lives on another
+host, because the script still runs on the server host.
+
 ## Variables and CLI lookup
 
 The plugin injects these variables:

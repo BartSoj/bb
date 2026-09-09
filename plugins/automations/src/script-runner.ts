@@ -15,6 +15,7 @@ import {
 
 const execFileAsync = promisify(execFile);
 const SCRIPT_OUTPUT_MAX_BYTES = 1024 * 1024;
+const SCRIPT_FAILURE_DETAIL_MAX_CHARS = 200;
 
 let resolvedBbPath: string | null = null;
 
@@ -53,6 +54,14 @@ export function bbBinaryCandidates(env: NodeJS.ProcessEnv): string[] {
   }
   candidates.push("/opt/homebrew/bin/bb", "/usr/local/bin/bb");
   return candidates;
+}
+
+async function isDirectory(candidate: string): Promise<boolean> {
+  try {
+    return (await stat(candidate)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 async function isExecutableFile(candidate: string): Promise<boolean> {
@@ -115,6 +124,7 @@ export function isWakeAgentSuppressed(output: string): boolean {
 export interface ScriptRunResult {
   exitCode: number | null;
   output: string;
+  stderr: string;
   timedOut: boolean;
 }
 
@@ -124,6 +134,17 @@ interface ScriptRunOutcome {
   exitCode: number | null;
   error: string | null;
   skipReason: string | null;
+}
+
+export function firstStderrLine(stderr: string): string | null {
+  for (const line of stderr.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    return trimmed.length > SCRIPT_FAILURE_DETAIL_MAX_CHARS
+      ? `${trimmed.slice(0, SCRIPT_FAILURE_DETAIL_MAX_CHARS - 1)}…`
+      : trimmed;
+  }
+  return null;
 }
 
 export function mapScriptResultToRun(
@@ -139,11 +160,14 @@ export function mapScriptResultToRun(
     };
   }
   if (result.exitCode !== 0) {
+    const detail = firstStderrLine(result.stderr);
     return {
       status: "failed",
       output: result.output.length > 0 ? result.output : null,
       exitCode: result.exitCode,
-      error: `Script exited with code ${result.exitCode}`,
+      error: `Script exited with code ${result.exitCode}${
+        detail === null ? "" : `: ${detail}`
+      }`,
       skipReason: null,
     };
   }
@@ -245,11 +269,13 @@ function executeWithProcessGroup(args: {
         signalProcessGroup(child, "SIGKILL");
       }
       const suffix = outputLimitExceeded ? "\n[output truncated]\n" : "";
+      const stderr = Buffer.concat(stderrChunks).toString("utf8");
       resolve({
         exitCode: timedOut ? null : outputLimitExceeded ? 1 : code,
-        output: `${Buffer.concat(stdoutChunks).toString("utf8")}${Buffer.concat(
-          stderrChunks,
-        ).toString("utf8")}${suffix}`,
+        output: `${Buffer.concat(stdoutChunks).toString(
+          "utf8",
+        )}${stderr}${suffix}`,
+        stderr,
         timedOut,
       });
     });
@@ -271,6 +297,7 @@ export async function executeStoredScript(args: {
   timeoutMs: number;
   env?: Record<string, string>;
   serverUrl: string;
+  workingDir: string | null;
 }): Promise<ScriptRunResult> {
   const scriptPath = await resolveAutomationScriptPath({
     dataDir: args.pluginDataDir,
@@ -293,8 +320,12 @@ export async function executeStoredScript(args: {
   if (bbPath !== null) {
     scriptEnv.BB_CLI = bbPath;
   }
-  const cwd = scriptsRoot(args.pluginDataDir);
-  await mkdir(cwd, { recursive: true });
+  const scriptsDir = scriptsRoot(args.pluginDataDir);
+  await mkdir(scriptsDir, { recursive: true });
+  const cwd =
+    args.workingDir !== null && (await isDirectory(args.workingDir))
+      ? args.workingDir
+      : scriptsDir;
   const result = await executeWithProcessGroup({
     command: interpreter,
     scriptPath,

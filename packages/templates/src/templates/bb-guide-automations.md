@@ -46,6 +46,11 @@ apply until you run `update <automationId> --script-file <path>` again;
 print the stored copy path on the `Script:` line (`execution.storedScriptPath`
 with `--json`).
 
+Scripts run on the bb server host. A run works in the project's default local
+source directory when that directory exists on the server host, and otherwise
+in `<data dir>/plugins/automations/scripts/`. A failed run reports the exit code
+and the first stderr line in the `Detail` column of `runs`.
+
 `update` can combine name, schedule, and execution changes. A complete agent
 replacement supplies `--prompt`, `--provider`, and `--model`; a script
 replacement supplies a complete script source. Partial updates to an existing

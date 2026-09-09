@@ -26,7 +26,14 @@ const hostListSchema = z.array(
   z.object({ status: z.enum(["connected", "disconnected"]) }).passthrough(),
 );
 type SweepApi = AgentRunApi & {
-  sdk: { hosts: { list(): Promise<unknown> } };
+  sdk: {
+    hosts: { list(): Promise<unknown> };
+    projects: {
+      get(
+        args: Parameters<BbPluginApi["sdk"]["projects"]["get"]>[0],
+      ): Promise<unknown>;
+    };
+  };
 };
 
 function buildScheduleFailureHandler(

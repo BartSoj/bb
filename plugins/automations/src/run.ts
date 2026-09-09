@@ -32,6 +32,14 @@ type AgentThreadsSdk = {
 export type AgentRunApi = Pick<BbPluginApi, "realtime" | "log"> & {
   sdk: { threads: AgentThreadsSdk };
 };
+type ProjectsSdk = {
+  get(
+    args: Parameters<BbPluginApi["sdk"]["projects"]["get"]>[0],
+  ): Promise<unknown>;
+};
+type ScriptRunApi = Pick<BbPluginApi, "realtime" | "log"> & {
+  sdk: { projects: ProjectsSdk };
+};
 
 const sdkThreadSchema = z
   .object({
@@ -49,6 +57,18 @@ const sdkThreadSchema = z
   })
   .passthrough();
 type SdkThread = z.infer<typeof sdkThreadSchema>;
+
+const projectSourcesSchema = z
+  .object({ sources: z.array(z.unknown()) })
+  .passthrough();
+
+const localPathProjectSourceSchema = z
+  .object({
+    type: z.literal("local_path"),
+    path: z.string().min(1),
+    isDefault: z.boolean(),
+  })
+  .passthrough();
 
 const projectGoneErrorSchema = z
   .object({
@@ -246,8 +266,34 @@ function closeRunForUnusableTargetThread(
   );
 }
 
+function defaultLocalProjectPath(project: unknown): string | null {
+  const parsed = projectSourcesSchema.safeParse(project);
+  if (!parsed.success) return null;
+  const localSources = parsed.data.sources.flatMap((source) => {
+    const local = localPathProjectSourceSchema.safeParse(source);
+    return local.success ? [local.data] : [];
+  });
+  const preferred =
+    localSources.find((source) => source.isDefault) ?? localSources[0];
+  return preferred?.path ?? null;
+}
+
+async function resolveScriptWorkingDir(
+  bb: ScriptRunApi,
+  projectId: string,
+): Promise<string | null> {
+  try {
+    return defaultLocalProjectPath(await bb.sdk.projects.get({ projectId }));
+  } catch (error) {
+    bb.log.warn(
+      `Could not resolve a project directory for ${projectId}; the script runs in the automations scripts directory: ${errorMessage(error)}`,
+    );
+    return null;
+  }
+}
+
 export async function executeScriptRun(
-  bb: Pick<BbPluginApi, "realtime" | "log">,
+  bb: ScriptRunApi,
   db: Db,
   args: {
     pluginDataDir: string;
@@ -279,6 +325,7 @@ export async function executeScriptRun(
       timeoutMs: args.execution.timeoutMs,
       env: args.execution.env,
       serverUrl: args.serverUrl,
+      workingDir: await resolveScriptWorkingDir(bb, args.automation.projectId),
     });
     const mapped = mapScriptResultToRun(result);
     closeAutomationRun(db, {

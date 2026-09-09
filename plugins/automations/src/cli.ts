@@ -813,6 +813,10 @@ bb automation resume <automationId> --project <id>
 bb automation run <automationId> --project <id> [--idempotency-key <key>]
 bb automation runs <automationId> --project <id> [--limit <count>] [--output <runId>]
 bb automation delete <automationId> --project <id> --yes
+
+Scripts run on the bb server host. Each run works in the project's default
+source directory when that directory exists on the server host, and otherwise
+in the automations plugin's own scripts directory.
 `;
 }
 

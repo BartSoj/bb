@@ -4,6 +4,7 @@ import {
   mkdir,
   readFile,
   readdir,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -42,11 +43,11 @@ import {
   mapScriptResultToRun,
   scriptPathEnv,
 } from "./script-runner.js";
-import { reconcileRunningAutomationRuns } from "./run.js";
+import { executeScriptRun, reconcileRunningAutomationRuns } from "./run.js";
 import { sweepDueAutomations } from "./sweep.js";
 import { createAutomationService } from "./service.js";
 import { registerAutomationCli } from "./cli.js";
-import { automationScriptDir } from "./script-files.js";
+import { automationScriptDir, scriptsRoot } from "./script-files.js";
 
 function createTestDb(): Db {
   const db = new Database(":memory:");
@@ -814,6 +815,11 @@ describe("automation data access", () => {
               updatedAt: 1,
             },
           ],
+        },
+        projects: {
+          get: async () => {
+            throw new Error("not expected");
+          },
         },
         threads: {
           get: async () => {
@@ -1664,6 +1670,7 @@ describe("script process containment", () => {
         interpreter: "bash",
         timeoutMs: 1_000,
         serverUrl: "http://127.0.0.1:38886",
+        workingDir: null,
       });
       const childPidMatch = result.output.match(/^child_pid=(\d+)$/mu);
       const childPid = Number.parseInt(childPidMatch?.[1] ?? "", 10);
@@ -1683,6 +1690,161 @@ describe("script process containment", () => {
   });
 });
 
+describe("script working directory", () => {
+  async function runScriptAutomation(args: {
+    script: string;
+    project: () => Promise<unknown>;
+  }) {
+    const db = createTestDb();
+    const pluginDataDir = await mkdtemp(join(tmpdir(), "bb-auto-cwd-"));
+    const scriptDir = automationScriptDir(pluginDataDir, "auto_cwd");
+    await mkdir(scriptDir, { recursive: true });
+    await writeFile(join(scriptDir, "script.sh"), args.script);
+    const execution = {
+      mode: "script" as const,
+      scriptFile: "script.sh",
+      interpreter: "bash" as const,
+      timeoutMs: 10_000,
+    };
+    const automation = createAutomation(db, {
+      id: "auto_cwd",
+      projectId: "proj_test",
+      name: "Working directory",
+      enabled: true,
+      trigger: { triggerType: "once", runAt: 2000 },
+      runMode: "script",
+      execution,
+      origin: "human",
+      createdByThreadId: null,
+      nextRunAt: 2000,
+    });
+    const { run } = createManualRun(db, {
+      automationId: automation.id,
+      runMode: "script",
+      now: 2000,
+    });
+    const warnings: string[] = [];
+    try {
+      await executeScriptRun(
+        {
+          sdk: { projects: { get: args.project } },
+          realtime: { publish: () => undefined },
+          log: {
+            debug: () => undefined,
+            error: () => undefined,
+            info: () => undefined,
+            warn: (message: string) => void warnings.push(message),
+          },
+        },
+        db,
+        {
+          pluginDataDir,
+          automation,
+          run,
+          execution,
+          onFailure: () => undefined,
+          serverUrl: "http://127.0.0.1:38886",
+        },
+      );
+      const [closed] = listAutomationRuns(db, {
+        automationId: automation.id,
+        limit: 1,
+      });
+      return {
+        closed,
+        warnings,
+        scriptsDir: await realpath(scriptsRoot(pluginDataDir)),
+      };
+    } finally {
+      await rm(pluginDataDir, { recursive: true, force: true });
+    }
+  }
+
+  function projectWithSources(sources: unknown[]) {
+    return async () => ({
+      id: "proj_test",
+      kind: "standard",
+      name: "Test Project",
+      gitRemoteUrl: null,
+      createdAt: 1,
+      updatedAt: 1,
+      sources,
+    });
+  }
+
+  function localPathSource(path: string, isDefault: boolean) {
+    return {
+      id: `psrc_${isDefault ? "default" : "extra"}`,
+      projectId: "proj_test",
+      type: "local_path",
+      hostId: "host_test",
+      path,
+      isDefault,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+  }
+
+  it("runs the script in the project's default source directory", async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), "bb-auto-project-"));
+    const otherDir = await mkdtemp(join(tmpdir(), "bb-auto-other-"));
+    try {
+      const result = await runScriptAutomation({
+        script: "pwd -P\n",
+        project: projectWithSources([
+          localPathSource(otherDir, false),
+          localPathSource(projectDir, true),
+        ]),
+      });
+      expect(result.closed?.status).toBe("succeeded");
+      expect(result.closed?.output).toContain(await realpath(projectDir));
+      expect(result.warnings).toEqual([]);
+    } finally {
+      await rm(projectDir, { recursive: true, force: true });
+      await rm(otherDir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the scripts directory without a usable local source", async () => {
+    const missing = await runScriptAutomation({
+      script: "pwd -P\n",
+      project: projectWithSources([
+        localPathSource(join(tmpdir(), "bb-auto-absent-checkout"), true),
+      ]),
+    });
+    expect(missing.closed?.output).toContain(missing.scriptsDir);
+
+    const unscoped = await runScriptAutomation({
+      script: "pwd -P\n",
+      project: projectWithSources([]),
+    });
+    expect(unscoped.closed?.output).toContain(unscoped.scriptsDir);
+    expect(unscoped.warnings).toEqual([]);
+
+    const unavailable = await runScriptAutomation({
+      script: "pwd -P\n",
+      project: async () => {
+        throw new Error("Project not found");
+      },
+    });
+    expect(unavailable.closed?.output).toContain(unavailable.scriptsDir);
+    expect(unavailable.warnings).toHaveLength(1);
+    expect(unavailable.warnings[0]).toContain("Project not found");
+  });
+
+  it("reports the first stderr line of a failing script", async () => {
+    const result = await runScriptAutomation({
+      script:
+        "echo \"python3: can't open file 'bin/build-views.py'\" >&2\nexit 2\n",
+      project: projectWithSources([]),
+    });
+    expect(result.closed?.status).toBe("failed");
+    expect(result.closed?.error).toBe(
+      "Script exited with code 2: python3: can't open file 'bin/build-views.py'",
+    );
+  });
+});
+
 describe("script wake gate", () => {
   it("suppresses only a trailing wakeAgent false object", () => {
     expect(isWakeAgentSuppressed('hello\n{"wakeAgent": false}\n')).toBe(true);
@@ -1692,18 +1854,51 @@ describe("script wake gate", () => {
 
   it("maps silent successful scripts to skipped runs", () => {
     expect(
-      mapScriptResultToRun({ exitCode: 0, output: "", timedOut: false }),
+      mapScriptResultToRun({
+        exitCode: 0,
+        output: "",
+        stderr: "",
+        timedOut: false,
+      }),
     ).toMatchObject({ status: "skipped", skipReason: "empty output" });
     expect(
       mapScriptResultToRun({
         exitCode: 0,
         output: 'nothing\n{"wakeAgent": false}',
+        stderr: "",
         timedOut: false,
       }),
     ).toMatchObject({ status: "skipped", skipReason: "wakeAgent false" });
     expect(
-      mapScriptResultToRun({ exitCode: 2, output: "bad", timedOut: false }),
+      mapScriptResultToRun({
+        exitCode: 2,
+        output: "bad",
+        stderr: "",
+        timedOut: false,
+      }),
     ).toMatchObject({ status: "failed", error: "Script exited with code 2" });
+  });
+
+  it("summarizes a failure with the first non-empty stderr line", () => {
+    expect(
+      mapScriptResultToRun({
+        exitCode: 2,
+        output: "out\n  boom: no such file\nlater noise\n",
+        stderr: "\n  boom: no such file\nlater noise\n",
+        timedOut: false,
+      }),
+    ).toMatchObject({
+      status: "failed",
+      error: "Script exited with code 2: boom: no such file",
+    });
+    expect(
+      mapScriptResultToRun({
+        exitCode: 1,
+        output: "x".repeat(400),
+        stderr: `${"x".repeat(400)}\n`,
+        timedOut: false,
+      }).error,
+    ).toBe(`Script exited with code 1: ${"x".repeat(199)}…`);
   });
 });
 
